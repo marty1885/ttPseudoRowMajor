@@ -24,6 +24,7 @@
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/tensor/tensor_spec.hpp>
 #include <ttnn/tensor/layout/tensor_layout.hpp>
+#include <ttnn/operations/core/to_memory_config/to_memory_config_op.hpp>
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/normalization/layernorm/layernorm.hpp>
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
@@ -33,6 +34,7 @@
 using namespace tt::tt_metal;
 using ttprm::add;
 using ttprm::fma;
+using ttprm::k_update;
 using ttprm::l2_norm;
 using ttprm::layer_norm;
 using ttprm::lerp;
@@ -59,6 +61,18 @@ TensorSpec tspec(int64_t rows, int64_t cols) {
     return TensorSpec(ttnn::Shape({(uint32_t)rows, (uint32_t)cols}),
                       TensorLayout(DataType::BFLOAT16,
                                    PageConfig(tt::tt_metal::Layout::TILE), MemoryConfig{}));
+}
+
+TensorSpec tspec4(int64_t d0, int64_t d1, int64_t d2, int64_t d3) {
+    return TensorSpec(ttnn::Shape({(uint32_t)d0, (uint32_t)d1, (uint32_t)d2, (uint32_t)d3}),
+                      TensorLayout(DataType::BFLOAT16,
+                                   PageConfig(tt::tt_metal::Layout::TILE), MemoryConfig{}));
+}
+
+MemoryConfig width_sharded_64x64_config() {
+    tt::tt_metal::CoreRangeSet cores({tt::tt_metal::CoreRange({0, 0}, {1, 0})});
+    ShardSpec shard_spec(cores, {64, 32}, ShardOrientation::ROW_MAJOR);
+    return MemoryConfig(TensorMemoryLayout::WIDTH_SHARDED, BufferType::L1, shard_spec);
 }
 
 // A [rows,cols] device tensor with logical element (r,c) = val(r*cols+c).
@@ -121,6 +135,13 @@ ttnn::Tensor make_fn(distributed::MeshDevice* dev, int64_t rows, int64_t cols, F
     return ttnn::Tensor::from_vector(h, tspec(rows, cols), dev);
 }
 
+template <typename Fn>
+ttnn::Tensor make_fn4(distributed::MeshDevice* dev, int64_t d0, int64_t d1, int64_t d2, int64_t d3, Fn fn) {
+    std::vector<float> h((size_t)d0 * d1 * d2 * d3);
+    for (int64_t i = 0; i < d0 * d1 * d2 * d3; i++) h[i] = (float)fn(i);
+    return ttnn::Tensor::from_vector(h, tspec4(d0, d1, d2, d3), dev);
+}
+
 // Relative comparison for float ops (mul) where the bf16 result is rounded, not exact.
 bool close(const std::vector<float>& a, const std::vector<float>& b, float rel = 0.02f) {
     if (a.size() != b.size()) return false;
@@ -149,6 +170,47 @@ int main() {
 
         auto nr = l2_norm(view_of(a), 1e-6f, std::nullopt, l1);
         check("l2_norm forwards memory_config=L1", nr && nr.value().memory_config().buffer_type() == BufferType::L1);
+    }
+
+    // ============ non-DRAM/interleaved memory modes ============
+    {
+        const MemoryConfig l1(TensorMemoryLayout::INTERLEAVED, BufferType::L1);
+        auto in = ttnn::to_memory_config(make_input(dev.get(), 64, 64), l1);
+        auto r = realize(view_of(in).slice({{0, 64, 1}, {16, 48, 1}}), std::nullopt, l1);
+        std::vector<float> want((size_t)64 * 32);
+        for (int64_t row = 0; row < 64; row++)
+            for (int64_t col = 0; col < 32; col++) want[row * 32 + col] = val(row * 64 + 16 + col);
+        check("realize L1 input -> L1 output", r && r.value().memory_config().buffer_type() == BufferType::L1 &&
+                                                   exact(logical(r.value()), want),
+              r ? "matches oracle" : r.error().c_str());
+    }
+    {
+        const MemoryConfig l1(TensorMemoryLayout::INTERLEAVED, BufferType::L1);
+        auto a = ttnn::to_memory_config(make_input(dev.get(), 64, 64), l1);
+        auto b = ttnn::to_memory_config(make_input2(dev.get(), 64, 64), l1);
+        auto r = add(view_of(a), view_of(b), std::nullopt, l1);
+        check("add L1 inputs -> L1 output", r && r.value().memory_config().buffer_type() == BufferType::L1 &&
+                                            exact(logical(r.value()), add_vec(logical(a), logical(b))),
+              r ? "matches oracle" : r.error().c_str());
+    }
+    {
+        auto sharded = width_sharded_64x64_config();
+        auto in = ttnn::to_memory_config(make_input(dev.get(), 64, 64), sharded);
+        auto r = realize(view_of(in), std::nullopt, sharded);
+        check("realize WIDTH_SHARDED input -> WIDTH_SHARDED output",
+              r && r.value().memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED &&
+                  exact(logical(r.value()), logical(in)),
+              r ? "matches oracle" : r.error().c_str());
+    }
+    {
+        auto sharded = width_sharded_64x64_config();
+        auto a = ttnn::to_memory_config(make_input(dev.get(), 64, 64), sharded);
+        auto b = ttnn::to_memory_config(make_input2(dev.get(), 64, 64), sharded);
+        auto r = add(view_of(a), view_of(b), std::nullopt, sharded);
+        check("add WIDTH_SHARDED inputs -> WIDTH_SHARDED output",
+              r && r.value().memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED &&
+                  exact(logical(r.value()), add_vec(logical(a), logical(b))),
+              r ? "matches oracle" : r.error().c_str());
     }
 
     // ============ reshape / flatten chains -- oracle = ttnn::reshape ============
@@ -582,6 +644,120 @@ int main() {
         if (!r) check("fma bcast a[32,64] (x3) * b[96,64] + c[96,64]", false, r.error().c_str());
         else check("fma bcast a[32,64] (x3) * b[96,64] + c[96,64]",
                    exact(logical(r.value()), oracle), "matches oracle");
+    }
+    {
+        // RWKV k-update composed as current llama lowering does:
+        // tmp = k * k_a; sum = a * tmp + k; out = sum - tmp.
+        // k/a/out are [G*Rg,C], k_a is [Rg,C] broadcast over G token groups.
+        const int64_t Rg = 64, C = 64, G = 4;
+        auto k = make_fn(dev.get(), G * Rg, C, [](int64_t i) { return (i % 5) - 2; });
+        auto a = make_fn(dev.get(), G * Rg, C, [](int64_t i) { return i % 4; });
+        auto ka = make_fn(dev.get(), Rg, C, [](int64_t i) { return (i % 3) - 1; });
+        auto tmp = mul(view_of(k), view_of(ka), view_of_shape(G * Rg, C));
+        auto sum = tmp ? fma(view_of(a), view_of(tmp.value()), view_of(k), view_of_shape(G * Rg, C))
+                       : ttprm::Result<ttnn::Tensor>::err(tmp.error());
+        auto out = sum ? sub(view_of(sum.value()), view_of(tmp.value()), view_of_shape(G * Rg, C))
+                       : ttprm::Result<ttnn::Tensor>::err(sum.error());
+        auto kl = logical(k), al = logical(a), kal = logical(ka);
+        std::vector<float> oracle((size_t)G * Rg * C);
+        for (int64_t R = 0; R < G * Rg; R++)
+            for (int64_t col = 0; col < C; col++) {
+                const int64_t i = R * C + col;
+                const float t = kl[i] * kal[(R % Rg) * C + col];
+                oracle[i] = kl[i] + al[i] * t - t;
+            }
+        if (!tmp) check("rwkv k-update composed tmp=k*k_a", false, tmp.error().c_str());
+        else if (!sum) check("rwkv k-update composed sum=a*tmp+k", false, sum.error().c_str());
+        else if (!out) check("rwkv k-update composed out=sum-tmp", false, out.error().c_str());
+        else check("rwkv k-update composed broadcast", exact(logical(out.value()), oracle), "matches oracle");
+    }
+    {
+        // Same semantics through the dedicated fused op.
+        const int64_t Rg = 64, C = 64, G = 4;
+        auto k = make_fn(dev.get(), G * Rg, C, [](int64_t i) { return (i % 5) - 2; });
+        auto a = make_fn(dev.get(), G * Rg, C, [](int64_t i) { return i % 4; });
+        auto ka = make_fn(dev.get(), Rg, C, [](int64_t i) { return (i % 3) - 1; });
+        auto r = k_update(view_of(k), view_of(a), view_of(ka), view_of_shape(G * Rg, C));
+        auto kl = logical(k), al = logical(a), kal = logical(ka);
+        std::vector<float> oracle((size_t)G * Rg * C);
+        for (int64_t R = 0; R < G * Rg; R++)
+            for (int64_t col = 0; col < C; col++) {
+                const int64_t i = R * C + col;
+                const float t = kl[i] * kal[(R % Rg) * C + col];
+                oracle[i] = kl[i] + al[i] * t - t;
+            }
+        if (!r) check("rwkv k-update fused broadcast", false, r.error().c_str());
+        else check("rwkv k-update fused broadcast", exact(logical(r.value()), oracle), "matches oracle");
+    }
+    {
+        // Exact llama lowering shape: GGML [n_embd,nt] is TTNN [1,1,nt,n_embd]. The
+        // lowering presents k/a as [hc*nt,hs], k_a as [hc,hs], and scatters into a
+        // bound 4D [1,1,nt,n_embd] output via the same [hc*nt,hs] view.
+        const int64_t hs = 64, hc = 64, nt = 4, n_embd = hs * hc;
+        auto k = make_fn4(dev.get(), 1, 1, nt, n_embd, [](int64_t i) { return (i % 5) - 2; });
+        auto a = make_fn4(dev.get(), 1, 1, nt, n_embd, [](int64_t i) { return i % 4; });
+        auto ka = make_fn4(dev.get(), 1, 1, 1, n_embd, [](int64_t i) { return (i % 3) - 1; });
+        auto dst = make_fn4(dev.get(), 1, 1, nt, n_embd, [](int64_t) { return 99; });
+
+        auto head_flat = [&](const ttnn::Tensor& t) {
+            View v = view_of(t);
+            return v.slice({{0, v.rows(), 1}, {0, v.cols(), 1}}).reshape({hc * nt, hs});
+        };
+        View kv = head_flat(k);
+        View av = head_flat(a);
+        View kav0 = view_of(ka);
+        View kav = kav0.slice({{0, kav0.rows(), 1}, {0, kav0.cols(), 1}}).reshape({hc, hs});
+        View ov0 = view_of(dst);
+        View ov = ov0.slice({{0, ov0.rows(), 1}, {0, ov0.cols(), 1}}).reshape({hc * nt, hs});
+
+        auto tmp = mul(kv, kav);
+        auto sum = tmp ? fma(av, view_of(tmp.value()), kv, view_of_shape(hc * nt, hs))
+                       : ttprm::Result<ttnn::Tensor>::err(tmp.error());
+        auto out = sum ? sub(view_of(sum.value()), view_of(tmp.value()), ov)
+                       : ttprm::Result<ttnn::Tensor>::err(sum.error());
+
+        auto kl = logical(k), al = logical(a), kal = logical(ka);
+        std::vector<float> oracle((size_t)nt * n_embd);
+        for (int64_t t = 0; t < nt; t++)
+            for (int64_t e = 0; e < n_embd; e++) {
+                const int64_t i = t * n_embd + e;
+                const float tmpv = kl[i] * kal[e];
+                oracle[i] = kl[i] + al[i] * tmpv - tmpv;
+            }
+        if (!tmp) check("rwkv k-update composed 4D tmp=k*k_a", false, tmp.error().c_str());
+        else if (!sum) check("rwkv k-update composed 4D sum=a*tmp+k", false, sum.error().c_str());
+        else if (!out) check("rwkv k-update composed 4D out=sum-tmp", false, out.error().c_str());
+        else check("rwkv k-update composed 4D bound output", exact(logical(dst), oracle), "matches oracle");
+    }
+    {
+        const int64_t hs = 64, hc = 64, nt = 4, n_embd = hs * hc;
+        auto k = make_fn4(dev.get(), 1, 1, nt, n_embd, [](int64_t i) { return (i % 5) - 2; });
+        auto a = make_fn4(dev.get(), 1, 1, nt, n_embd, [](int64_t i) { return i % 4; });
+        auto ka = make_fn4(dev.get(), 1, 1, 1, n_embd, [](int64_t i) { return (i % 3) - 1; });
+        auto dst = make_fn4(dev.get(), 1, 1, nt, n_embd, [](int64_t) { return 99; });
+
+        auto head_flat = [&](const ttnn::Tensor& t) {
+            View v = view_of(t);
+            return v.slice({{0, v.rows(), 1}, {0, v.cols(), 1}}).reshape({hc * nt, hs});
+        };
+        View kv = head_flat(k);
+        View av = head_flat(a);
+        View kav0 = view_of(ka);
+        View kav = kav0.slice({{0, kav0.rows(), 1}, {0, kav0.cols(), 1}}).reshape({hc, hs});
+        View ov0 = view_of(dst);
+        View ov = ov0.slice({{0, ov0.rows(), 1}, {0, ov0.cols(), 1}}).reshape({hc * nt, hs});
+
+        auto r = k_update(kv, av, kav, ov);
+        auto kl = logical(k), al = logical(a), kal = logical(ka);
+        std::vector<float> oracle((size_t)nt * n_embd);
+        for (int64_t t = 0; t < nt; t++)
+            for (int64_t e = 0; e < n_embd; e++) {
+                const int64_t i = t * n_embd + e;
+                const float tmpv = kl[i] * kal[e];
+                oracle[i] = kl[i] + al[i] * tmpv - tmpv;
+            }
+        if (!r) check("rwkv k-update fused 4D bound output", false, r.error().c_str());
+        else check("rwkv k-update fused 4D bound output", exact(logical(dst), oracle), "matches oracle");
     }
     {
         // lerp the RWKV shape: TWO broadcast operands. a[32,64] & b[32,64] broadcast over G=3, w[96,64]

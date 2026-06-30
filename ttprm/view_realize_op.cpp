@@ -647,6 +647,177 @@ struct ViewTernaryDeviceOperation {
 
 }  // namespace vt
 
+// Fused RWKV7 k update: out = k + (a - 1) * (k * k_a).
+namespace vku {
+
+struct operation_attributes_t {
+    uint32_t k_kind = 0, a_kind = 0, ka_kind = 0, out_kind = 0;
+    int32_t out_rows = 0, out_cols = 0;
+    int32_t n_otr = 0, n_otc = 0;
+    int32_t tpg = 0;
+    uint32_t k_bcast = 0, a_bcast = 0, ka_bcast = 0;
+    MemoryConfig memory_config;
+    ViewArgs7 k, a, ka, o;
+};
+struct tensor_args_t {
+    const ttnn::Tensor& k; const ttnn::Tensor& a; const ttnn::Tensor& ka;
+    std::optional<ttnn::Tensor> opt_out;
+};
+using spec_return_value_t   = ttnn::TensorSpec;
+using tensor_return_value_t = ttnn::Tensor;
+
+namespace program {
+struct ViewKUpdateFactory {
+    struct shared_variables_t { KernelHandle reader, writer; CoreRangeSet all_cores; };
+    using cached_program_t = ttnn::device_operation::CachedProgram<shared_variables_t>;
+
+    static std::vector<uint32_t> reader_args(const operation_attributes_t& a, uint32_t k_addr,
+                                             uint32_t a_addr, uint32_t ka_addr,
+                                             uint32_t done, uint32_t count) {
+        const uint32_t t0_k  = a.k_bcast  ? 0u : done;
+        const uint32_t t0_a  = a.a_bcast  ? 0u : done;
+        const uint32_t t0_ka = a.ka_bcast ? 0u : done;
+        std::vector<uint32_t> v{k_addr, a_addr, ka_addr, count, (uint32_t)a.tpg,
+                                a.k_bcast, a.a_bcast, a.ka_bcast};
+        append_view_args(v, a.k_kind,  t0_k,  to_desc(a.k));
+        append_view_args(v, a.a_kind,  t0_a,  to_desc(a.a));
+        append_view_args(v, a.ka_kind, t0_ka, to_desc(a.ka));
+        return v;
+    }
+    static std::vector<uint32_t> compute_args(const operation_attributes_t& a, uint32_t done,
+                                              uint32_t count) {
+        return {count, (uint32_t)a.tpg, done % (uint32_t)a.tpg, a.k_bcast, a.a_bcast, a.ka_bcast};
+    }
+    static std::vector<uint32_t> writer_args(const operation_attributes_t& a, uint32_t o_addr,
+                                             uint32_t t0, uint32_t count) {
+        std::vector<uint32_t> v{o_addr, count};
+        append_view_args(v, a.out_kind, t0, to_desc(a.o));
+        return v;
+    }
+
+    static cached_program_t create(
+        const operation_attributes_t& a, const tensor_args_t& t, tensor_return_value_t& out) {
+        Program prog = CreateProgram();
+        const uint32_t wt    = (uint32_t)(a.n_otr * a.n_otc);
+        const uint32_t tpg   = (uint32_t)a.tpg;
+        const bool     bcast = a.k_bcast || a.a_bcast || a.ka_bcast;
+        const uint32_t units = bcast ? wt / tpg : wt;
+
+        MeshDevice* dev = t.k.device();
+        auto grid = dev->compute_with_storage_grid_size();
+        auto [num_cores, all_cores, cg1, cg2, upc1, upc2] =
+            tt::tt_metal::split_work_to_cores(grid, units);
+
+        const uint32_t k_pages  = a.k_bcast  ? (uint32_t)a.tpg : 4u;
+        const uint32_t a_pages  = a.a_bcast  ? (uint32_t)a.tpg : 4u;
+        const uint32_t ka_pages = a.ka_bcast ? (uint32_t)a.tpg : 4u;
+        mkcb(prog, all_cores, tt::CBIndex::c_0,  2048u, k_pages,  tt::DataFormat::Float16_b);
+        mkcb(prog, all_cores, tt::CBIndex::c_1,  2048u, a_pages,  tt::DataFormat::Float16_b);
+        mkcb(prog, all_cores, tt::CBIndex::c_2,  2048u, ka_pages, tt::DataFormat::Float16_b);
+        mkcb(prog, all_cores, tt::CBIndex::c_16, 2048u, 4, tt::DataFormat::Float16_b);
+        mkcb(prog, all_cores, tt::CBIndex::c_25, 2048u, 4, tt::DataFormat::Float16_b);
+        mkcb(prog, all_cores, tt::CBIndex::c_26, 2048u, 4, tt::DataFormat::Float16_b);
+        mkcb(prog, all_cores, tt::CBIndex::c_27, 2048u, 4, tt::DataFormat::Float16_b);
+        mkcb(prog, all_cores, tt::CBIndex::c_31, 2048u, 1, tt::DataFormat::Float16_b);
+
+        const std::string ttnn_inc = std::string(getenv("TT_METAL_HOME")) + "/ttnn";
+        std::vector<uint32_t> rct;
+        TensorAccessorArgs(*t.k.buffer()).append_to(rct);
+        TensorAccessorArgs(*t.a.buffer()).append_to(rct);
+        TensorAccessorArgs(*t.ka.buffer()).append_to(rct);
+        KernelHandle reader = CreateKernel(prog, TTPRM_ROOT "/kernel/view_ternary_reader.cpp", all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default,
+                               .compile_args = rct,
+                               .defines = {{"TTPRM_A_VIEW", view_type_name(a.k_kind)},
+                                           {"TTPRM_B_VIEW", view_type_name(a.a_kind)},
+                                           {"TTPRM_C_VIEW", view_type_name(a.ka_kind)}},
+                               .compiler_include_paths = {TTPRM_ROOT, ttnn_inc}});
+        std::vector<uint32_t> wct; TensorAccessorArgs(*out.buffer()).append_to(wct);
+        KernelHandle writer = CreateKernel(prog, TTPRM_ROOT "/kernel/view_realize_writer.cpp", all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1, .noc = NOC::RISCV_1_default,
+                               .compile_args = wct,
+                               .defines = {{"TTPRM_OUT_VIEW", view_type_name(a.out_kind)},
+                                           {"TTPRM_OUT_CB", "16"}},
+                               .compiler_include_paths = {TTPRM_ROOT, ttnn_inc}});
+        KernelHandle compute = CreateKernel(prog, TTPRM_ROOT "/kernel/view_k_update_compute.cpp", all_cores,
+            ComputeConfig{.compile_args = {}});
+
+        const uint32_t k_addr  = (uint32_t)t.k.buffer()->address();
+        const uint32_t a_addr  = (uint32_t)t.a.buffer()->address();
+        const uint32_t ka_addr = (uint32_t)t.ka.buffer()->address();
+        const uint32_t o_addr  = (uint32_t)out.buffer()->address();
+        const auto cores = corerange_to_cores(all_cores, num_cores, /*row_wise=*/true);
+        uint32_t done_u = 0;
+        for (uint32_t i = 0; i < num_cores; i++) {
+            const CoreCoord cc = cores[i];
+            const uint32_t here_u = cg1.contains(cc) ? upc1 : upc2;
+            const uint32_t done_t  = bcast ? done_u * tpg : done_u;
+            const uint32_t count_t = bcast ? here_u * tpg : here_u;
+            SetRuntimeArgs(prog, reader, cc, reader_args(a, k_addr, a_addr, ka_addr, done_t, count_t));
+            SetRuntimeArgs(prog, writer, cc, writer_args(a, o_addr, done_t, count_t));
+            SetRuntimeArgs(prog, compute, cc, compute_args(a, done_t, count_t));
+            done_u += here_u;
+        }
+        return {std::move(prog), shared_variables_t{reader, writer, all_cores}};
+    }
+
+    static void override_runtime_arguments(
+        cached_program_t& cp, const operation_attributes_t&, const tensor_args_t& t,
+        tensor_return_value_t& out) {
+        auto& prog = cp.program;
+        const uint32_t k_addr  = (uint32_t)t.k.buffer()->address();
+        const uint32_t a_addr  = (uint32_t)t.a.buffer()->address();
+        const uint32_t ka_addr = (uint32_t)t.ka.buffer()->address();
+        const uint32_t o_addr  = (uint32_t)out.buffer()->address();
+        for (const auto& range : cp.shared_variables.all_cores.ranges())
+            for (const auto& core : range) {
+                auto& ra = GetRuntimeArgs(prog, cp.shared_variables.reader, core);
+                ra[0] = k_addr; ra[1] = a_addr; ra[2] = ka_addr;
+                GetRuntimeArgs(prog, cp.shared_variables.writer, core)[0] = o_addr;
+            }
+    }
+};
+}  // namespace program
+
+struct ViewKUpdateDeviceOperation {
+    using operation_attributes_t = vku::operation_attributes_t;
+    using tensor_args_t          = vku::tensor_args_t;
+    using spec_return_value_t    = vku::spec_return_value_t;
+    using tensor_return_value_t  = vku::tensor_return_value_t;
+    using program_factory_t      = std::variant<program::ViewKUpdateFactory>;
+
+    static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&) {
+        return program::ViewKUpdateFactory{};
+    }
+    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&) {}
+    static void validate_on_program_cache_hit(const operation_attributes_t&, const tensor_args_t&) {}
+    static spec_return_value_t compute_output_specs(const operation_attributes_t& a, const tensor_args_t&) {
+        return tile_spec(a.out_rows, a.out_cols, a.memory_config);
+    }
+    static tensor_return_value_t create_output_tensors(const operation_attributes_t& a, const tensor_args_t& t) {
+        return resolve_output(t.opt_out, compute_output_specs(a, t), t.k.device());
+    }
+    static std::tuple<operation_attributes_t, tensor_args_t> invoke(
+        const ttnn::Tensor& k, const ttnn::Tensor& av, const ttnn::Tensor& ka,
+        const AffineDesc& dk, const AffineDesc& da, const AffineDesc& dka,
+        const AffineDesc& dout, int32_t out_rows, int32_t out_cols, int32_t tpg,
+        uint32_t k_bcast, uint32_t a_bcast, uint32_t ka_bcast,
+        std::optional<ttnn::Tensor> opt_out = std::nullopt,
+        const std::optional<MemoryConfig>& memory_config = std::nullopt) {
+        operation_attributes_t at;
+        at.k_kind = kind_of(dk); at.a_kind = kind_of(da); at.ka_kind = kind_of(dka);
+        at.out_kind = kind_of(dout);
+        at.out_rows = out_rows; at.out_cols = out_cols;
+        at.n_otr = (int32_t)dout.n_otr; at.n_otc = (int32_t)dout.n_otc;
+        at.tpg = tpg; at.k_bcast = k_bcast; at.a_bcast = a_bcast; at.ka_bcast = ka_bcast;
+        at.memory_config = output_memory_config(opt_out, memory_config);
+        at.k = from_desc(dk); at.a = from_desc(da); at.ka = from_desc(dka); at.o = from_desc(dout);
+        return { at, tensor_args_t{k, av, ka, std::move(opt_out)} };
+    }
+};
+
+}  // namespace vku
+
 // Fused norm op: out = NORM(view_x(x)) per head, laid out by an output view.
 // The reduction unit is one tile-row; optional gamma/beta are per-lane.
 //   L2 (op 0): y = x * rsqrt(Σx² + eps)                       (no affine)
@@ -2041,6 +2212,64 @@ Result<ttnn::Tensor> rk(const View& r, const View& k, const View& r_k, const Vie
         w_bcast, rbs_per_group, std::move(od), memory_config);
     return Result<ttnn::Tensor>::ok(
         ttnn::device_operation::detail::launch<vrk::ViewRkDeviceOperation>(attrs, args));
+}
+
+Result<ttnn::Tensor> k_update(const View& k, const View& a, const View& k_a,
+                              std::optional<View> out,
+                              const std::optional<MemoryConfig>& memory_config) {
+    struct In { const char* name; const View& view; };
+    const In ins[3] = {{"k", k}, {"a", a}, {"k_a", k_a}};
+    AffineDesc d[3];
+    for (int i = 0; i < 3; i++) {
+        if (!ins[i].view.tensor())
+            return Result<ttnn::Tensor>::err(std::string(ins[i].name) + ": view has no bound tensor");
+        std::string m = validate_device_tile_bf16(*ins[i].view.tensor());
+        if (!m.empty()) return Result<ttnn::Tensor>::err(std::string(ins[i].name) + ": " + m);
+        d[i] = lower(ins[i].view.layout());
+        if (!d[i].ok)
+            return Result<ttnn::Tensor>::err(std::string(ins[i].name) + " view REJECT: " + d[i].why);
+    }
+
+    AffineDesc& dk  = d[0];
+    AffineDesc& da  = d[1];
+    AffineDesc& dka = d[2];
+    if (da.n_otr != dk.n_otr || da.n_otc != dk.n_otc || da.Ro != dk.Ro || da.Co != dk.Co)
+        return Result<ttnn::Tensor>::err("k_update: k and a must present the same head grid");
+
+    int64_t out_rows, out_cols;
+    LayoutView out_lv(0, 0);
+    if (out) {
+        out_lv = out->layout(); out_rows = out->rows(); out_cols = out->cols();
+    } else {
+        const auto p = k.layout().plan();
+        out_rows = p.Ro; out_cols = p.Co;
+        out_lv = View::of_shape(out_rows, out_cols).layout();
+    }
+    AffineDesc dout = lower(out_lv);
+    if (!dout.ok) return Result<ttnn::Tensor>::err("out view REJECT: " + dout.why);
+    if (dout.n_otr != dk.n_otr || dout.n_otc != dk.n_otc || dout.Ro != dk.Ro || dout.Co != dk.Co)
+        return Result<ttnn::Tensor>::err("k_update output grid must match k/a (shape-preserving)");
+
+    const int64_t wt = dout.out_tiles();
+    int64_t tpg = wt;
+    uint32_t k_bcast = 0, a_bcast = 0, ka_bcast = 0;
+    std::string e;
+    e = classify_operand(dk, dout, out_rows, wt, tpg, k_bcast);
+    if (!e.empty()) return Result<ttnn::Tensor>::err("k: " + e);
+    e = classify_operand(da, dout, out_rows, wt, tpg, a_bcast);
+    if (!e.empty()) return Result<ttnn::Tensor>::err("a: " + e);
+    e = classify_operand(dka, dout, out_rows, wt, tpg, ka_bcast);
+    if (!e.empty()) return Result<ttnn::Tensor>::err("k_a: " + e);
+
+    std::string oe; auto od = bound_dst(out, oe);
+    if (!oe.empty()) return Result<ttnn::Tensor>::err(oe);
+
+    auto [attrs, args] = vku::ViewKUpdateDeviceOperation::invoke(
+        *k.tensor(), *a.tensor(), *k_a.tensor(), dk, da, dka, dout,
+        (int32_t)out_rows, (int32_t)out_cols, (int32_t)tpg, k_bcast, a_bcast, ka_bcast,
+        std::move(od), memory_config);
+    return Result<ttnn::Tensor>::ok(
+        ttnn::device_operation::detail::launch<vku::ViewKUpdateDeviceOperation>(attrs, args));
 }
 
 // ---- INDEXED ROW GATHER / SCATTER (KV / state cache) ------------------------------

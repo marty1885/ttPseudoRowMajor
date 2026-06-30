@@ -209,4 +209,12 @@ Result<ttnn::Tensor> rk(const View& r, const View& k, const View& r_k, const Vie
                         const View& cur, std::optional<View> out = std::nullopt,
                         const std::optional<tt::tt_metal::MemoryConfig>& memory_config = std::nullopt);
 
+// Fused RWKV7 k update:
+//   out = k + (a - 1) * (k * k_a)
+// k and a carry the full head grid; k_a may be one token's [head_count, head_size]
+// parameter grid broadcast over the token axis.
+Result<ttnn::Tensor> k_update(const View& k, const View& a, const View& k_a,
+                              std::optional<View> out = std::nullopt,
+                              const std::optional<tt::tt_metal::MemoryConfig>& memory_config = std::nullopt);
+
 }  // namespace ttprm
